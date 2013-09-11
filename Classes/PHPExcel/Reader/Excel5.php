@@ -82,6 +82,7 @@ class PHPExcel_Reader_Excel5 extends PHPExcel_Reader_Abstract implements PHPExce
 	const XLS_BIFF7						= 0x0500;
 	const XLS_WorkbookGlobals			= 0x0005;
 	const XLS_Worksheet					= 0x0010;
+	const XLS_Chart						= 0x0020;
 
 	// record identifiers
 	const XLS_Type_FORMULA				= 0x0006;
@@ -447,6 +448,15 @@ class PHPExcel_Reader_Excel5 extends PHPExcel_Reader_Abstract implements PHPExce
 	 */
 	private $_sharedFormulaParts;
 
+	/**
+	 * The data for all the charts in the sheets, stored as a 2 dimensional array
+	 * $_chartData = [
+	 *     'sheet1' => ['data', 'data']
+	 * ]
+	 *
+	 * @var array
+	 */
+	private $_chartData = array();
 
 	/**
 	 * Create a new PHPExcel_Reader_Excel5 instance
@@ -1117,6 +1127,16 @@ class PHPExcel_Reader_Excel5 extends PHPExcel_Reader_Abstract implements PHPExce
 			}
 		}
 
+		//read all the chartdata
+		//chartdata needs to be read after all sheets are loaded because it can reference data from all sheets
+		foreach ($this->_chartData as $sheetName => $charts) {
+			foreach ($charts as $chartData) {
+				$sheet = $this->_phpExcel->getSheetByName($sheetName);
+				$chart = $this->_readChart($sheet, $chartData);
+				$sheet->addChart($chart);
+			}
+		}
+
 		return $this->_phpExcel;
 	}
 
@@ -1611,8 +1631,23 @@ class PHPExcel_Reader_Excel5 extends PHPExcel_Reader_Abstract implements PHPExce
 				// it is unreliable (OpenOffice doc, 5.8), use only version information from the global stream
 				break;
 
+			case self::XLS_Chart:
+				$substreamStartPos = $this->_pos;
+				do {
+					$code = self::_GetInt2d($this->_data, $this->_pos);
+					$this->_readDefault();
+				} while ($code != self::XLS_Type_EOF && $this->_pos < $this->_dataSize);
+				$substreamEndPos = $this->_pos;
+				$substreamData = substr($this->_data, $substreamStartPos, $substreamEndPos);
+				if (!isset($this->_chartData[$this->_phpSheet->getTitle()])) {
+					$this->_chartData[$this->_phpSheet->getTitle()] = array();
+				}
+				//save the chart data for later processing, we need to parse all the sheets before we can read the charts correctly
+				$this->_chartData[$this->_phpSheet->getTitle()][] = $substreamData;
+				break;
+
 			default:
-				// substream, e.g. chart
+				// substream, e.g. macro
 				// just skip the entire substream
 				do {
 					$code = self::_GetInt2d($this->_data, $this->_pos);
@@ -1620,6 +1655,96 @@ class PHPExcel_Reader_Excel5 extends PHPExcel_Reader_Abstract implements PHPExce
 				} while ($code != self::XLS_Type_EOF && $this->_pos < $this->_dataSize);
 				break;
 		}
+	}
+
+	/**
+	* @param PHPExcel_Worksheet $sheet
+	* @param string             $substream
+	*
+	* @return PHPExcel_Chart
+	*/
+	private function _readChart($sheet, $substream)
+	{
+		$pos = 0;
+
+		$code = 0;
+		$xValues = null;
+		$yValues = null;
+		$plotType = '';
+		$title = '';
+		while ($code != self::XLS_Type_EOF && $pos < strlen($substream)) {
+			$code = self::_GetInt2d($substream, $pos);
+			$length = self::_GetInt2d($substream, $pos + 2);
+
+			//https://code.google.com/p/excellibrary/source/browse/trunk/Office/Excel/Enums/RecordType.cs?r=2
+			switch ($code) {
+				case self::XLS_Type_HEADER:
+				case self::XLS_Type_FOOTER:
+				case self::XLS_Type_VCENTER:
+				case self::XLS_Type_HCENTER:
+				case self::XLS_Type_LEFTMARGIN:
+				case self::XLS_Type_RIGHTMARGIN:
+				case self::XLS_Type_TOPMARGIN:
+				case self::XLS_Type_BOTTOMMARGIN:
+				case self::XLS_Type_PAGESETUP:
+				case self::XLS_Type_MSODRAWING:
+				case self::XLS_Type_PROTECT:
+				case self::XLS_Type_NUMBER:
+				case self::XLS_Type_CHUNITS:
+					break; //TODO
+				case self::XLS_Type_CHSOURCELINK:
+					// 0: series title or text box, 1: y values, 2: x values, 3: bubble sizes
+					$linkTarget = self::_GetInt1d($substream, $pos + 4);
+					// 0: no link, 1: constant, 2: linked to worksheet
+					$linkType = self::_GetInt1d($substream, $pos + 5);
+					// 0: number formated linked to data source, 1: custom number format
+					$linkOptions = self::_GetInt2d($substream, $pos + 6);
+					$numberFormatIndex = self::_GetInt2d($substream, $pos + 8);
+					$tokenArrayData = substr($substream, $pos + 10, $length - 6);
+					if ($tokenArrayData) {
+						$formula = self::_getFormulaFromStructure($tokenArrayData);
+					} else {
+						$formula = null;
+					}
+					switch ($linkTarget) {
+						case 0:
+							if ($formula) {
+								$calcEngine = PHPExcel_Calculation::getInstance($this->_phpExcel);
+								$result = $calcEngine->_calculateFormulaValue(
+									'=' . $formula,
+									null,
+									$sheet->getCell('A1')
+								);
+								$result = PHPExcel_Calculation::_unwrapResult($result);
+								$result = PHPExcel_Calculation_Functions::flattenArray($result);
+								$title = $result[0];
+							}
+							break;
+						case 1:
+							$yValues
+								= new PHPExcel_Chart_DataSeriesValues(PHPExcel_Chart_DataSeriesValues::DATASERIES_TYPE_NUMBER, $formula);
+							break;
+						case 2:
+							$xValues
+								= new PHPExcel_Chart_DataSeriesValues(PHPExcel_Chart_DataSeriesValues::DATASERIES_TYPE_NUMBER, $formula);
+							break;
+					}
+					break;
+				case self::XLS_Type_CHSCATTER:
+					$plotType = 'scatterChart';
+					break;
+				default:
+					break;
+//					echo dechex($code) . " length: " . $length . "\n";
+//					hex_dump(substr($substream, $pos, 4 + $length));
+			}
+			$pos += 4 + $length;
+		}
+		$plotAreaLayout = new PHPExcel_Chart_Layout();
+		$dataSeries
+			= new PHPExcel_Chart_DataSeries($plotType, null, array(), array(), array($xValues), array($yValues), true);
+		$plotArea = new PHPExcel_Chart_PlotArea($plotAreaLayout, array($dataSeries));
+		return new PHPExcel_Chart('name', new PHPExcel_Chart_Title(array($title)), null, $plotArea);
 	}
 
 
@@ -6595,6 +6720,18 @@ class PHPExcel_Reader_Excel5 extends PHPExcel_Reader_Abstract implements PHPExce
 		return PHPExcel_Shared_String::ConvertEncoding($string, 'UTF-8', $this->_codepage);
 	}
 
+	/**
+	 * Read 8-bit unsigned integer
+	 *
+	 * @param string $data
+	 * @param int    $pos
+	 *
+	 * @return int
+	 */
+	public static function _GetInt1d($data, $pos)
+	{
+		return ord($data[$pos]);
+	}
 
 	/**
 	 * Read 16-bit unsigned integer
